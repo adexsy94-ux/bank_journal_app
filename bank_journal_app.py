@@ -665,6 +665,16 @@ using a **Suspense Account** in between (Option B), then builds:
         help="Bank balance at the start of the reporting period (for cashflow reconciliation)."
     )
 
+    # NEW: Manual closing balance input
+    closing_bank_balance_manual = st.sidebar.number_input(
+        "Closing bank balance for period (per bank statement)",
+        min_value=-1_000_000_000.0,
+        max_value=1_000_000_000.0,
+        value=0.0,
+        step=1000.0,
+        help="Closing bank balance from your bank statement for this period."
+    )
+
     st.sidebar.markdown("---")
     st.sidebar.header("CAC / Equity Inputs")
 
@@ -1198,11 +1208,75 @@ using a **Suspense Account** in between (Option B), then builds:
                     mime="text/csv",
                 )
 
+                # --- Add manual closing balance comparison logic ---
+                closing_calc = None
+                try:
+                    closing_calc_row = cf_summary[cf_summary["Line"] == "Closing bank balance (Opening + Net cash)"]
+                    if not closing_calc_row.empty:
+                        closing_calc = float(closing_calc_row["Amount"].iloc[0])
+                except Exception:
+                    closing_calc = None
+
+                # Build display summary including manual closing and difference vs manual
+                cf_summary_display = cf_summary.copy()
+
+                # Add manual closing balance row
+                cf_summary_display = pd.concat(
+                    [
+                        cf_summary_display,
+                        pd.DataFrame(
+                            [
+                                {
+                                    "Line": "Closing bank balance (per bank statement/manual input)",
+                                    "Amount": closing_bank_balance_manual,
+                                }
+                            ]
+                        ),
+                    ],
+                    ignore_index=True,
+                )
+
+                # Add difference vs manual closing, if we have a computed closing
+                if closing_calc is not None:
+                    difference_manual = closing_calc - closing_bank_balance_manual
+                    cf_summary_display = pd.concat(
+                        [
+                            cf_summary_display,
+                            pd.DataFrame(
+                                [
+                                    {
+                                        "Line": "Difference vs manual closing (computed - manual)",
+                                        "Amount": difference_manual,
+                                    }
+                                ]
+                            ),
+                        ],
+                        ignore_index=True,
+                    )
+
+                    # Visual check
+                    if abs(difference_manual) < 0.01:
+                        st.success(
+                            f"✅ Computed closing bank balance matches the manual closing balance you entered "
+                            f"(difference {difference_manual:,.2f})."
+                        )
+                    else:
+                        st.error(
+                            f"❌ Computed closing bank balance ({closing_calc:,.2f}) does NOT match "
+                            f"manual closing balance ({closing_bank_balance_manual:,.2f}). "
+                            f"Difference: {difference_manual:,.2f}."
+                        )
+                else:
+                    st.info(
+                        "Could not determine computed closing bank balance for comparison. "
+                        "Check that the cashflow summary contains the closing balance line."
+                    )
+
                 st.markdown("#### Cashflow Summary (Operating / Investing / Financing)")
-                st.dataframe(cf_summary)
+                st.dataframe(cf_summary_display)
 
                 summary_csv = io.StringIO()
-                cf_summary.to_csv(summary_csv, index=False)
+                cf_summary_display.to_csv(summary_csv, index=False)
                 st.download_button(
                     label="Download Cashflow Summary (CSV)",
                     data=summary_csv.getvalue(),
