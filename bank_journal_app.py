@@ -665,7 +665,7 @@ using a **Suspense Account** in between (Option B), then builds:
         help="Bank balance at the start of the reporting period (for cashflow reconciliation)."
     )
 
-    # NEW: Manual closing balance input
+    # Manual closing balance input
     closing_bank_balance_manual = st.sidebar.number_input(
         "Closing bank balance for period (per bank statement)",
         min_value=-1_000_000_000.0,
@@ -1208,10 +1208,10 @@ using a **Suspense Account** in between (Option B), then builds:
                     mime="text/csv",
                 )
 
-                # --- Add manual closing balance comparison logic ---
+                # --- Use running ledger closing balance for reconciliation ---
                 closing_calc = None
                 try:
-                    closing_calc_row = cf_summary[cf_summary["Line"] == "Closing bank balance (Opening + Net cash)"]
+                    closing_calc_row = cf_summary[cf_summary["Line"] == "Closing bank balance (from running ledger)"]
                     if not closing_calc_row.empty:
                         closing_calc = float(closing_calc_row["Amount"].iloc[0])
                 except Exception:
@@ -1254,7 +1254,6 @@ using a **Suspense Account** in between (Option B), then builds:
                         ignore_index=True,
                     )
 
-                    # Visual check
                     if abs(difference_manual) < 0.01:
                         st.success(
                             f"✅ Computed closing bank balance matches the manual closing balance you entered "
