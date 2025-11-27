@@ -527,21 +527,121 @@ def build_balance_sheet(tb_with_totals: pd.DataFrame) -> Dict[str, pd.DataFrame]
     return result
 
 
+def append_opening_balance_journal(
+    journal_df: pd.DataFrame,
+    bank_account_name: str,
+    bank_account_type: str,
+    opening_balance: float
+) -> pd.DataFrame:
+    """
+    Append opening balance as a proper double-entry in the journal:
+
+    - Cash side: Bank account (bank_account_name / bank_account_type)
+    - Offset side: 'Opening Balance Offset' (Equity)
+
+    Tagged with Cash Flow Category = 'Opening Balance' so
+    it is excluded from Operating/Investing/Financing net cash,
+    but included in the running cash balance.
+    """
+    if journal_df.empty or abs(opening_balance) < 1e-9:
+        return journal_df
+
+    df_dates = ensure_journal_dates(journal_df)
+    valid_dates = df_dates["Date_dt"].dropna()
+
+    if valid_dates.empty:
+        # No valid dates found, just leave journal as is
+        return journal_df
+
+    earliest_dt = valid_dates.min()
+    opening_date_value = earliest_dt  # can store as Timestamp; Streamlit will handle
+
+    offset_account_type = "Equity"
+    offset_account_name = "Opening Balance Offset"
+
+    rows: List[Dict] = []
+
+    if opening_balance > 0:
+        # Opening is a positive bank balance: Dr Bank, Cr Offset
+        rows.append(
+            {
+                "Date": opening_date_value,
+                "Transaction / Details": "Opening bank balance",
+                "Leg": 0,
+                "Account Type": bank_account_type,
+                "Account": bank_account_name,
+                "Dr Amount": opening_balance,
+                "Cr Amount": 0.0,
+                "Narration": "Opening bank balance brought forward",
+                "Cash Flow Category": "Opening Balance",
+            }
+        )
+        rows.append(
+            {
+                "Date": opening_date_value,
+                "Transaction / Details": "Opening bank balance",
+                "Leg": 0,
+                "Account Type": offset_account_type,
+                "Account": offset_account_name,
+                "Dr Amount": 0.0,
+                "Cr Amount": opening_balance,
+                "Narration": "Opening bank balance counterpart",
+                "Cash Flow Category": "Opening Balance",
+            }
+        )
+    else:
+        # Negative opening (overdraft): Cr Bank, Dr Offset
+        obal = abs(opening_balance)
+        rows.append(
+            {
+                "Date": opening_date_value,
+                "Transaction / Details": "Opening bank balance (overdraft)",
+                "Leg": 0,
+                "Account Type": offset_account_type,
+                "Account": offset_account_name,
+                "Dr Amount": obal,
+                "Cr Amount": 0.0,
+                "Narration": "Opening overdraft counterpart",
+                "Cash Flow Category": "Opening Balance",
+            }
+        )
+        rows.append(
+            {
+                "Date": opening_date_value,
+                "Transaction / Details": "Opening bank balance (overdraft)",
+                "Leg": 0,
+                "Account Type": bank_account_type,
+                "Account": bank_account_name,
+                "Dr Amount": 0.0,
+                "Cr Amount": obal,
+                "Narration": "Opening overdraft brought forward",
+                "Cash Flow Category": "Opening Balance",
+            }
+        )
+
+    opening_df = pd.DataFrame(rows)
+    combined = pd.concat([opening_df, journal_df], ignore_index=True)
+    combined = combined.sort_values(by=["Date", "Leg"]).reset_index(drop=True)
+    return combined
+
+
 def build_cashbook_ifrs(
     journal_df: pd.DataFrame,
     bank_account_name: str,
-    opening_balance: float
+    opening_balance: float  # kept for signature; logic uses journal Opening Balance entry
 ) -> (pd.DataFrame, pd.DataFrame):
     """
     IFRS-style cashflow based on bank account movements.
 
     - Only rows where Account == bank_account_name
-    - Uses 'Cash Flow Category' (Operating / Investing / Financing) from bank legs.
+    - Uses 'Cash Flow Category' (Operating / Investing / Financing / Opening Balance)
     - Computes:
-        * Net cash from operating, investing, financing
+        * Net cash from operating, investing, financing (EXCLUDES 'Opening Balance')
         * Net increase/decrease in cash
-        * Closing bank balance = opening + net_cash_movement
-        * Running cash balance per transaction
+        * Opening bank balance from Opening Balance journal entry
+        * Closing bank balance (Opening + Net cash)
+        * Closing bank balance from running ledger
+        * Difference between the two (should be 0)
     """
     df = ensure_journal_dates(journal_df)
 
@@ -562,16 +662,21 @@ def build_cashbook_ifrs(
     else:
         cb["Cash Flow Category"] = "Operating"
 
-    # Running cash balance including opening balance
-    cb["Running_Cash_Balance"] = opening_balance + cb["Cash_Movement"].cumsum()
+    # Running cash balance based purely on journal movements
+    cb["Running_Cash_Balance"] = cb["Cash_Movement"].cumsum()
 
-    # Summaries by section
+    # Opening balance from journal (rows tagged as Opening Balance)
+    opening_journal_balance = cb.loc[
+        cb["Cash Flow Category"] == "Opening Balance", "Cash_Movement"
+    ].sum()
+
+    # Summaries by section (exclude Opening Balance category from net cash)
     operating_total = cb.loc[cb["Cash Flow Category"] == "Operating", "Cash_Movement"].sum()
     investing_total = cb.loc[cb["Cash Flow Category"] == "Investing", "Cash_Movement"].sum()
     financing_total = cb.loc[cb["Cash Flow Category"] == "Financing", "Cash_Movement"].sum()
 
     net_change = operating_total + investing_total + financing_total
-    closing_balance_calc = opening_balance + net_change
+    closing_balance_calc = opening_journal_balance + net_change
 
     # Last running balance from movements
     closing_balance_running = cb["Running_Cash_Balance"].iloc[-1]
@@ -583,7 +688,7 @@ def build_cashbook_ifrs(
         {"Line": "Net cash from Investing activities", "Amount": investing_total},
         {"Line": "Net cash from Financing activities", "Amount": financing_total},
         {"Line": "Net increase / (decrease) in cash", "Amount": net_change},
-        {"Line": "Opening bank balance", "Amount": opening_balance},
+        {"Line": "Opening bank balance (per journal Opening Balance entry)", "Amount": opening_journal_balance},
         {"Line": "Closing bank balance (Opening + Net cash)", "Amount": closing_balance_calc},
         {"Line": "Closing bank balance (from running ledger)", "Amount": closing_balance_running},
         {"Line": "Difference (should be 0)", "Amount": diff},
@@ -657,12 +762,12 @@ using a **Suspense Account** in between (Option B), then builds:
     )
 
     opening_bank_balance = st.sidebar.number_input(
-        "Opening bank balance for period",
+        "Opening bank balance for period (per bank statement)",
         min_value=-1_000_000_000.0,
         max_value=1_000_000_000.0,
         value=0.0,
         step=1000.0,
-        help="Bank balance at the start of the reporting period (for cashflow reconciliation)."
+        help="Bank balance at the start of the reporting period. This will be posted into the journal."
     )
 
     # Manual closing balance input
@@ -746,6 +851,36 @@ using a **Suspense Account** in between (Option B), then builds:
         df_norm = normalize_columns(df_raw)
 
         # -------------------------
+        # Hard date validation: flag abnormal dates before anything else
+        # -------------------------
+        if "start date" in df_norm.columns:
+            original_dates = df_norm["start date"]
+            parsed_dates_full = pd.to_datetime(
+                original_dates,
+                errors="coerce",
+                dayfirst=True
+            )
+
+            # Any non-empty value that failed to parse is "abnormal"
+            non_empty_mask = original_dates.astype(str).str.strip() != ""
+            invalid_mask = non_empty_mask & parsed_dates_full.isna()
+
+            if invalid_mask.any():
+                invalid_rows = df_norm.loc[invalid_mask, ["start date"]].copy()
+                # Approximate Excel row number: +2 (header row is 1)
+                invalid_rows["Row_Number_in_File"] = invalid_rows.index + 2
+
+                st.error(
+                    "⚠️ Some rows have invalid dates in the 'start date' column. "
+                    "Please correct them in your Excel/CSV and re-upload."
+                )
+                st.markdown("Below are the first few problematic rows (Excel row number & value):")
+                st.dataframe(
+                    invalid_rows[["Row_Number_in_File", "start date"]].head(20)
+                )
+                st.stop()
+
+        # -------------------------
         # Date Filter Section - YOU choose the date(s)
         # -------------------------
         st.markdown("---")
@@ -819,6 +954,14 @@ using a **Suspense Account** in between (Option B), then builds:
             suspense_account_type=suspense_account_type,
         )
 
+        # Append opening balance into the journal as double-entry
+        journal_df = append_opening_balance_journal(
+            journal_df,
+            bank_account_name=bank_account_name,
+            bank_account_type=bank_account_type,
+            opening_balance=opening_bank_balance,
+        )
+
         st.markdown("---")
         st.subheader("4️⃣ Reports from Journal")
 
@@ -832,7 +975,7 @@ using a **Suspense Account** in between (Option B), then builds:
 
         # ------------- Journal Tab -------------
         with tab_journal:
-            st.markdown("### Journal (4-leg entries)")
+            st.markdown("### Journal (4-leg entries, including Opening Balance if provided)")
             st.dataframe(journal_df)
 
             out_csv_buffer = io.StringIO()
@@ -1190,7 +1333,7 @@ using a **Suspense Account** in between (Option B), then builds:
             cashbook_df, cf_summary = build_cashbook_ifrs(
                 journal_df,
                 bank_account_name=bank_account_name,
-                opening_balance=opening_bank_balance
+                opening_balance=opening_bank_balance  # now used only for consistency checks internally if needed
             )
 
             if cashbook_df.empty:
@@ -1263,7 +1406,12 @@ using a **Suspense Account** in between (Option B), then builds:
                         st.error(
                             f"❌ Computed closing bank balance ({closing_calc:,.2f}) does NOT match "
                             f"manual closing balance ({closing_bank_balance_manual:,.2f}). "
-                            f"Difference: {difference_manual:,.2f}."
+                            f"Difference: {difference_manual:,.2f}.\n\n"
+                            "This usually means one of the following:\n"
+                            "• The opening balance posted or typed does not match the bank statement opening for this date range.\n"
+                            "• Some statement lines are missing, duplicated or outside the selected date range.\n"
+                            "• The uploaded file has been edited (e.g. a debit/credit swapped).\n"
+                            "Please review the uploaded data, opening balance and date filter."
                         )
                 else:
                     st.info(
