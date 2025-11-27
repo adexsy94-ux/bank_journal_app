@@ -59,6 +59,15 @@ It’s designed to take a CSV/Excel bank statement in a simple template format a
 
 ---
 
+- **Needed Account Type**
+
+  - Expense
+  - Income
+  - Current Asset
+  - Non-Current Liability
+  - Share Capital
+  - Cost of Sales
+
 ##  Requirements
 
 - Python 3.9+ (recommended)
