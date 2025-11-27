@@ -554,7 +554,7 @@ def append_opening_balance_journal(
         return journal_df
 
     earliest_dt = valid_dates.min()
-    opening_date_value = earliest_dt  # can store as Timestamp; Streamlit will handle
+    opening_date_value = earliest_dt  # store as Timestamp
 
     offset_account_type = "Equity"
     offset_account_name = "Opening Balance Offset"
@@ -628,7 +628,7 @@ def append_opening_balance_journal(
 def build_cashbook_ifrs(
     journal_df: pd.DataFrame,
     bank_account_name: str,
-    opening_balance: float  # kept for signature; logic uses journal Opening Balance entry
+    opening_balance: float  # kept in signature; actual opening comes from journal
 ) -> (pd.DataFrame, pd.DataFrame):
     """
     IFRS-style cashflow based on bank account movements.
@@ -969,6 +969,132 @@ using a **Suspense Account** in between (Option B), then builds:
             st.warning("No valid rows found to convert (check DEBIT/CREDIT, dates, and template columns).")
             return
 
+        # Precompute some shared data for tabs and Excel
+        gl_df_all = build_gl_detail(journal_df)
+        tb_df_all = build_trial_balance(journal_df)
+        revenue_df_all, cos_df_all, expense_df_all, is_summary_df_all = build_income_statement(tb_df_all)
+        bs_dict_all = build_balance_sheet(tb_df_all)
+        cashbook_df_all, cf_summary_all = build_cashbook_ifrs(
+            journal_df,
+            bank_account_name=bank_account_name,
+            opening_balance=opening_bank_balance
+        )
+
+        # Build Balance Sheet layout and CAC equity summary for reuse (tab + Excel)
+        current_assets_all = bs_dict_all["current_assets"]
+        noncurrent_assets_all = bs_dict_all["noncurrent_assets"]
+        current_liabilities_all = bs_dict_all["current_liabilities"]
+        noncurrent_liabilities_all = bs_dict_all["noncurrent_liabilities"]
+        equity_df_all = bs_dict_all["equity"]
+
+        total_current_assets_all = current_assets_all["Balance"].sum() if not current_assets_all.empty else 0.0
+        total_property_equipment_all = noncurrent_assets_all["Balance"].sum() if not noncurrent_assets_all.empty else 0.0
+        total_other_assets_all = 0.0
+        total_assets_all = total_current_assets_all + total_property_equipment_all + total_other_assets_all
+
+        total_current_liab_all = current_liabilities_all["Balance"].sum() if not current_liabilities_all.empty else 0.0
+        total_noncurrent_liab_all = noncurrent_liabilities_all["Balance"].sum() if not noncurrent_liabilities_all.empty else 0.0
+        total_liab_all = total_current_liab_all + total_noncurrent_liab_all
+
+        net_income_all = 0.0
+        try:
+            net_row_all = is_summary_df_all[is_summary_df_all["Line"] == "Net Profit / (Loss)"]
+            if not net_row_all.empty:
+                net_income_all = float(net_row_all["Amount"].iloc[0])
+        except Exception:
+            net_income_all = 0.0
+
+        total_equity_ledger_all = equity_df_all["Balance"].sum() if not equity_df_all.empty else 0.0
+        total_capital_all = total_equity_ledger_all + net_income_all
+        total_liab_capital_all = total_liab_all + total_capital_all
+        difference_all = total_assets_all - total_liab_capital_all
+
+        bs_rows_all = []
+
+        # ASSETS
+        bs_rows_all.append({"Section": "ASSETS", "Account": "", "Amount": ""})
+
+        bs_rows_all.append({"Section": "Current Assets", "Account": "", "Amount": ""})
+        for _, r in current_assets_all.iterrows():
+            bs_rows_all.append(
+                {"Section": "", "Account": r["Account"], "Amount": r["Balance"]}
+            )
+        bs_rows_all.append(
+            {"Section": "Total Current Assets", "Account": "", "Amount": total_current_assets_all}
+        )
+
+        bs_rows_all.append({"Section": "Property and Equipment", "Account": "", "Amount": ""})
+        for _, r in noncurrent_assets_all.iterrows():
+            bs_rows_all.append(
+                {"Section": "", "Account": r["Account"], "Amount": r["Balance"]}
+            )
+        bs_rows_all.append(
+            {"Section": "Total Property and Equipment", "Account": "", "Amount": total_property_equipment_all}
+        )
+
+        bs_rows_all.append({"Section": "Other Assets", "Account": "", "Amount": ""})
+        bs_rows_all.append({"Section": "Total Other Assets", "Account": "", "Amount": total_other_assets_all})
+
+        bs_rows_all.append({"Section": "Total Assets", "Account": "", "Amount": total_assets_all})
+
+        # Blank line
+        bs_rows_all.append({"Section": "", "Account": "", "Amount": ""})
+
+        # LIABILITIES & CAPITAL
+        bs_rows_all.append({"Section": "LIABILITIES AND CAPITAL", "Account": "", "Amount": ""})
+
+        bs_rows_all.append({"Section": "Current Liabilities", "Account": "", "Amount": ""})
+        for _, r in current_liabilities_all.iterrows():
+            bs_rows_all.append(
+                {"Section": "", "Account": r["Account"], "Amount": r["Balance"]}
+            )
+        bs_rows_all.append(
+            {"Section": "Total Current Liabilities", "Account": "", "Amount": total_current_liab_all}
+        )
+
+        bs_rows_all.append({"Section": "Long-Term Liabilities", "Account": "", "Amount": ""})
+        for _, r in noncurrent_liabilities_all.iterrows():
+            bs_rows_all.append(
+                {"Section": "", "Account": r["Account"], "Amount": r["Balance"]}
+            )
+        bs_rows_all.append(
+            {"Section": "Total Long-Term Liabilities", "Account": "", "Amount": total_noncurrent_liab_all}
+        )
+
+        bs_rows_all.append({"Section": "Total Liabilities", "Account": "", "Amount": total_liab_all})
+
+        bs_rows_all.append({"Section": "Capital", "Account": "", "Amount": ""})
+        for _, r in equity_df_all.iterrows():
+            bs_rows_all.append(
+                {"Section": "", "Account": r["Account"], "Amount": r["Balance"]}
+            )
+        bs_rows_all.append(
+            {"Section": "", "Account": "Net Income", "Amount": net_income_all}
+        )
+        bs_rows_all.append(
+            {"Section": "Total Capital", "Account": "", "Amount": total_capital_all}
+        )
+        bs_rows_all.append(
+            {"Section": "Total Liabilities & Capital", "Account": "", "Amount": total_liab_capital_all}
+        )
+        bs_rows_all.append(
+            {"Section": "Difference (Assets - [Liab + Capital])", "Account": "", "Amount": difference_all}
+        )
+
+        bs_layout_df_all = pd.DataFrame(bs_rows_all, columns=["Section", "Account", "Amount"])
+
+        # CAC / Equity summary table (same as in BS tab)
+        eq_rows_all = [
+            {"Line": "Number of shares", "Amount": number_of_shares},
+            {"Line": "Nominal value per share", "Amount": nominal_value_per_share},
+            {"Line": "Computed Share Capital (CAC)", "Amount": computed_share_capital},
+            {"Line": "Share Premium / Other CAC Equity", "Amount": share_premium_other},
+            {"Line": "Net Income (from Income Statement)", "Amount": net_income_all},
+            {"Line": "Ledger Equity balances (sum of equity accounts)", "Amount": total_equity_ledger_all},
+        ]
+        eq_df_all = pd.DataFrame(eq_rows_all)
+
+        # ------------- Tabs -------------
         tab_journal, tab_gl, tab_tb, tab_is, tab_bs, tab_cf = st.tabs(
             ["📄 Journal", "📘 General Ledger", "📊 Trial Balance", "📈 Income Statement", "📗 Statement of Financial Position", "💵 Cashflow (IFRS)"]
         )
@@ -990,12 +1116,11 @@ using a **Suspense Account** in between (Option B), then builds:
         # ------------- General Ledger Tab -------------
         with tab_gl:
             st.markdown("### General Ledger (per account, with running balance)")
-            gl_df = build_gl_detail(journal_df)
 
-            accounts = ["(All)"] + sorted(gl_df["Account"].dropna().unique().tolist())
+            accounts = ["(All)"] + sorted(gl_df_all["Account"].dropna().unique().tolist())
             selected_account = st.selectbox("Filter by account", accounts, index=0)
 
-            gl_display = gl_df.copy()
+            gl_display = gl_df_all.copy()
             if selected_account != "(All)":
                 gl_display = gl_display[gl_display["Account"] == selected_account]
 
@@ -1028,11 +1153,10 @@ using a **Suspense Account** in between (Option B), then builds:
         # ------------- Trial Balance Tab -------------
         with tab_tb:
             st.markdown("### Trial Balance (ledger balances)")
-            tb_df = build_trial_balance(journal_df)
-            st.dataframe(tb_df)
+            st.dataframe(tb_df_all)
 
             tb_csv = io.StringIO()
-            tb_df.to_csv(tb_csv, index=False)
+            tb_df_all.to_csv(tb_csv, index=False)
             st.download_button(
                 label="Download Trial Balance (CSV)",
                 data=tb_csv.getvalue(),
@@ -1044,23 +1168,20 @@ using a **Suspense Account** in between (Option B), then builds:
         with tab_is:
             st.markdown("### Income Statement (Profit or Loss)")
 
-            tb_df = build_trial_balance(journal_df)
-            revenue_df, cos_df, expense_df, summary_df = build_income_statement(tb_df)
-
             st.markdown("#### Revenue Accounts")
-            st.dataframe(revenue_df)
+            st.dataframe(revenue_df_all)
 
             st.markdown("#### Cost of Sales Accounts")
-            st.dataframe(cos_df)
+            st.dataframe(cos_df_all)
 
             st.markdown("#### Operating Expense Accounts")
-            st.dataframe(expense_df)
+            st.dataframe(expense_df_all)
 
             st.markdown("#### Summary")
-            st.dataframe(summary_df)
+            st.dataframe(is_summary_df_all)
 
             is_csv = io.StringIO()
-            summary_df.to_csv(is_csv, index=False)
+            is_summary_df_all.to_csv(is_csv, index=False)
             st.download_button(
                 label="Download Income Statement Summary (CSV)",
                 data=is_csv.getvalue(),
@@ -1071,187 +1192,11 @@ using a **Suspense Account** in between (Option B), then builds:
         # ------------- Balance Sheet Tab -------------
         with tab_bs:
             st.markdown("### Statement of Financial Position (Balance Sheet)")
+            st.dataframe(bs_layout_df_all)
 
-            # Build TB and Income Statement (to get Net Income)
-            tb_df = build_trial_balance(journal_df)
-            _, _, _, is_summary_df = build_income_statement(tb_df)
-
-            # Extract Net Income (Net Profit / Loss)
-            net_income = 0.0
-            try:
-                net_row = is_summary_df[is_summary_df["Line"] == "Net Profit / (Loss)"]
-                if not net_row.empty:
-                    net_income = float(net_row["Amount"].iloc[0])
-            except Exception:
-                net_income = 0.0
-
-            # Build BS classification
-            bs_dict = build_balance_sheet(tb_df)
-
-            current_assets = bs_dict["current_assets"]
-            noncurrent_assets = bs_dict["noncurrent_assets"]
-            current_liabilities = bs_dict["current_liabilities"]
-            noncurrent_liabilities = bs_dict["noncurrent_liabilities"]
-            equity_df = bs_dict["equity"]
-
-            # --- Assets totals (template style) ---
-            total_current_assets = current_assets["Balance"].sum() if not current_assets.empty else 0.0
-            total_property_equipment = noncurrent_assets["Balance"].sum() if not noncurrent_assets.empty else 0.0
-            total_other_assets = 0.0   # can be extended later if you have other asset category
-            total_assets = total_current_assets + total_property_equipment + total_other_assets
-
-            # --- Liabilities totals ---
-            total_current_liab = current_liabilities["Balance"].sum() if not current_liabilities.empty else 0.0
-            total_noncurrent_liab = noncurrent_liabilities["Balance"].sum() if not noncurrent_liabilities.empty else 0.0
-            total_liab = total_current_liab + total_noncurrent_liab
-
-            # --- Capital totals (from ledger only + net income) ---
-            total_equity_ledger = equity_df["Balance"].sum() if not equity_df.empty else 0.0
-            total_capital = total_equity_ledger + net_income
-
-            total_liab_capital = total_liab + total_capital
-            difference = total_assets - total_liab_capital
-
-            # --- Build template-style layout like your example ---
-            rows = []
-
-            # ASSETS
-            rows.append({"Section": "ASSETS", "Account": "", "Amount": ""})
-
-            rows.append({"Section": "Current Assets", "Account": "", "Amount": ""})
-            for _, r in current_assets.iterrows():
-                rows.append(
-                    {
-                        "Section": "",
-                        "Account": r["Account"],
-                        "Amount": r["Balance"],
-                    }
-                )
-            rows.append(
-                {"Section": "Total Current Assets", "Account": "", "Amount": total_current_assets}
-            )
-
-            rows.append({"Section": "Property and Equipment", "Account": "", "Amount": ""})
-            for _, r in noncurrent_assets.iterrows():
-                rows.append(
-                    {
-                        "Section": "",
-                        "Account": r["Account"],
-                        "Amount": r["Balance"],
-                    }
-                )
-            rows.append(
-                {
-                    "Section": "Total Property and Equipment",
-                    "Account": "",
-                    "Amount": total_property_equipment,
-                }
-            )
-
-            rows.append({"Section": "Other Assets", "Account": "", "Amount": ""})
-            # (No detailed other assets yet)
-            rows.append({"Section": "Total Other Assets", "Account": "", "Amount": total_other_assets})
-
-            rows.append({"Section": "Total Assets", "Account": "", "Amount": total_assets})
-
-            # Blank line
-            rows.append({"Section": "", "Account": "", "Amount": ""})
-
-            # LIABILITIES & CAPITAL
-            rows.append({"Section": "LIABILITIES AND CAPITAL", "Account": "", "Amount": ""})
-
-            # Current Liabilities
-            rows.append({"Section": "Current Liabilities", "Account": "", "Amount": ""})
-            for _, r in current_liabilities.iterrows():
-                rows.append(
-                    {
-                        "Section": "",
-                        "Account": r["Account"],
-                        "Amount": r["Balance"],
-                    }
-                )
-            rows.append(
-                {
-                    "Section": "Total Current Liabilities",
-                    "Account": "",
-                    "Amount": total_current_liab,
-                }
-            )
-
-            # Long-Term Liabilities (Non-Current)
-            rows.append({"Section": "Long-Term Liabilities", "Account": "", "Amount": ""})
-            for _, r in noncurrent_liabilities.iterrows():
-                rows.append(
-                    {
-                        "Section": "",
-                        "Account": r["Account"],
-                        "Amount": r["Balance"],
-                    }
-                )
-            rows.append(
-                {
-                    "Section": "Total Long-Term Liabilities",
-                    "Account": "",
-                    "Amount": total_noncurrent_liab,
-                }
-            )
-
-            rows.append({"Section": "Total Liabilities", "Account": "", "Amount": total_liab})
-
-            # Capital section
-            rows.append({"Section": "Capital", "Account": "", "Amount": ""})
-
-            # Equity accounts from ledger (if any)
-            for _, r in equity_df.iterrows():
-                rows.append(
-                    {
-                        "Section": "",
-                        "Account": r["Account"],
-                        "Amount": r["Balance"],
-                    }
-                )
-
-            # Net Income line
-            rows.append(
-                {
-                    "Section": "",
-                    "Account": "Net Income",
-                    "Amount": net_income,
-                }
-            )
-
-            # Total capital (ledger equity + net income)
-            rows.append(
-                {
-                    "Section": "Total Capital",
-                    "Account": "",
-                    "Amount": total_capital,
-                }
-            )
-
-            rows.append(
-                {
-                    "Section": "Total Liabilities & Capital",
-                    "Account": "",
-                    "Amount": total_liab_capital,
-                }
-            )
-
-            rows.append(
-                {
-                    "Section": "Difference (Assets - [Liab + Capital])",
-                    "Account": "",
-                    "Amount": difference,
-                }
-            )
-
-            bs_layout_df = pd.DataFrame(rows, columns=["Section", "Account", "Amount"])
-
-            st.dataframe(bs_layout_df)
-
-            # Download button for template-style balance sheet
+            # Download template-style balance sheet
             bs_layout_csv = io.StringIO()
-            bs_layout_df.to_csv(bs_layout_csv, index=False)
+            bs_layout_df_all.to_csv(bs_layout_csv, index=False)
             st.download_button(
                 label="Download Balance Sheet (template style, CSV)",
                 data=bs_layout_csv.getvalue(),
@@ -1259,18 +1204,8 @@ using a **Suspense Account** in between (Option B), then builds:
                 mime="text/csv",
             )
 
-            # CAC / Equity inputs summary + suggested journal
             st.markdown("#### CAC / Equity Inputs Summary")
-            eq_rows = [
-                {"Line": "Number of shares", "Amount": number_of_shares},
-                {"Line": "Nominal value per share", "Amount": nominal_value_per_share},
-                {"Line": "Computed Share Capital (CAC)", "Amount": computed_share_capital},
-                {"Line": "Share Premium / Other CAC Equity", "Amount": share_premium_other},
-                {"Line": "Net Income (from Income Statement)", "Amount": net_income},
-                {"Line": "Ledger Equity balances (sum of equity accounts)", "Amount": total_equity_ledger},
-            ]
-            eq_df = pd.DataFrame(eq_rows)
-            st.dataframe(eq_df)
+            st.dataframe(eq_df_all)
 
             st.markdown("#### Suggested CAC Opening Equity Journal (for your main books)")
             journal_suggestions = []
@@ -1330,20 +1265,14 @@ using a **Suspense Account** in between (Option B), then builds:
         with tab_cf:
             st.markdown(f"### IFRS-style Cashflow for {bank_account_name}")
 
-            cashbook_df, cf_summary = build_cashbook_ifrs(
-                journal_df,
-                bank_account_name=bank_account_name,
-                opening_balance=opening_bank_balance  # now used only for consistency checks internally if needed
-            )
-
-            if cashbook_df.empty:
+            if cashbook_df_all.empty:
                 st.warning(f"No entries found for bank account '{bank_account_name}'. Check the account name in settings.")
             else:
                 st.markdown("#### Detailed Bank Movements (with Cash Flow Category)")
-                st.dataframe(cashbook_df)
+                st.dataframe(cashbook_df_all)
 
                 cf_csv = io.StringIO()
-                cashbook_df.to_csv(cf_csv, index=False)
+                cashbook_df_all.to_csv(cf_csv, index=False)
                 st.download_button(
                     label="Download Cashbook (CSV)",
                     data=cf_csv.getvalue(),
@@ -1351,19 +1280,9 @@ using a **Suspense Account** in between (Option B), then builds:
                     mime="text/csv",
                 )
 
-                # --- Use running ledger closing balance for reconciliation ---
-                closing_calc = None
-                try:
-                    closing_calc_row = cf_summary[cf_summary["Line"] == "Closing bank balance (from running ledger)"]
-                    if not closing_calc_row.empty:
-                        closing_calc = float(closing_calc_row["Amount"].iloc[0])
-                except Exception:
-                    closing_calc = None
+                # Build summary display with manual closing comparison
+                cf_summary_display = cf_summary_all.copy()
 
-                # Build display summary including manual closing and difference vs manual
-                cf_summary_display = cf_summary.copy()
-
-                # Add manual closing balance row
                 cf_summary_display = pd.concat(
                     [
                         cf_summary_display,
@@ -1379,7 +1298,14 @@ using a **Suspense Account** in between (Option B), then builds:
                     ignore_index=True,
                 )
 
-                # Add difference vs manual closing, if we have a computed closing
+                closing_calc = None
+                try:
+                    closing_calc_row = cf_summary_all[cf_summary_all["Line"] == "Closing bank balance (from running ledger)"]
+                    if not closing_calc_row.empty:
+                        closing_calc = float(closing_calc_row["Amount"].iloc[0])
+                except Exception:
+                    closing_calc = None
+
                 if closing_calc is not None:
                     difference_manual = closing_calc - closing_bank_balance_manual
                     cf_summary_display = pd.concat(
@@ -1430,6 +1356,126 @@ using a **Suspense Account** in between (Option B), then builds:
                     file_name="cashflow_summary_ifrs.csv",
                     mime="text/csv",
                 )
+
+        # ------------- Download all reports as one Excel -------------
+        st.markdown("### ⬇️ Download ALL reports as one Excel file (multiple sheets)")
+
+        excel_buffer = io.BytesIO()
+
+        # Try xlsxwriter first, fall back to openpyxl if not installed
+        try:
+            with pd.ExcelWriter(excel_buffer, engine="xlsxwriter") as writer:
+                journal_df.to_excel(writer, sheet_name="Journal", index=False)
+                gl_df_all.to_excel(writer, sheet_name="GeneralLedger", index=False)
+                tb_df_all.to_excel(writer, sheet_name="TrialBalance", index=False)
+                revenue_df_all.to_excel(writer, sheet_name="IS_Revenue", index=False)
+                cos_df_all.to_excel(writer, sheet_name="IS_CostOfSales", index=False)
+                expense_df_all.to_excel(writer, sheet_name="IS_Expenses", index=False)
+                is_summary_df_all.to_excel(writer, sheet_name="IS_Summary", index=False)
+                bs_layout_df_all.to_excel(writer, sheet_name="BS_Layout", index=False)
+                cashbook_df_all.to_excel(writer, sheet_name="Cashbook", index=False)
+
+                # Build a fresh cf_summary_display for Excel (no Streamlit messages)
+                cf_summary_display_excel = cf_summary_all.copy()
+                cf_summary_display_excel = pd.concat(
+                    [
+                        cf_summary_display_excel,
+                        pd.DataFrame(
+                            [
+                                {
+                                    "Line": "Closing bank balance (per bank statement/manual input)",
+                                    "Amount": closing_bank_balance_manual,
+                                }
+                            ]
+                        ),
+                    ],
+                    ignore_index=True,
+                )
+                try:
+                    closing_calc_row_x = cf_summary_all[cf_summary_all["Line"] == "Closing bank balance (from running ledger)"]
+                    if not closing_calc_row_x.empty:
+                        closing_calc_x = float(closing_calc_row_x["Amount"].iloc[0])
+                        diff_manual_x = closing_calc_x - closing_bank_balance_manual
+                        cf_summary_display_excel = pd.concat(
+                            [
+                                cf_summary_display_excel,
+                                pd.DataFrame(
+                                    [
+                                        {
+                                            "Line": "Difference vs manual closing (computed - manual)",
+                                            "Amount": diff_manual_x,
+                                        }
+                                    ]
+                                ),
+                            ],
+                            ignore_index=True,
+                        )
+                except Exception:
+                    pass
+
+                cf_summary_display_excel.to_excel(writer, sheet_name="Cashflow_Summary", index=False)
+                eq_df_all.to_excel(writer, sheet_name="CAC_Equity", index=False)
+
+        except ImportError:
+            # Fallback if xlsxwriter is not installed
+            with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
+                journal_df.to_excel(writer, sheet_name="Journal", index=False)
+                gl_df_all.to_excel(writer, sheet_name="GeneralLedger", index=False)
+                tb_df_all.to_excel(writer, sheet_name="TrialBalance", index=False)
+                revenue_df_all.to_excel(writer, sheet_name="IS_Revenue", index=False)
+                cos_df_all.to_excel(writer, sheet_name="IS_CostOfSales", index=False)
+                expense_df_all.to_excel(writer, sheet_name="IS_Expenses", index=False)
+                is_summary_df_all.to_excel(writer, sheet_name="IS_Summary", index=False)
+                bs_layout_df_all.to_excel(writer, sheet_name="BS_Layout", index=False)
+                cashbook_df_all.to_excel(writer, sheet_name="Cashbook", index=False)
+
+                cf_summary_display_excel = cf_summary_all.copy()
+                cf_summary_display_excel = pd.concat(
+                    [
+                        cf_summary_display_excel,
+                        pd.DataFrame(
+                            [
+                                {
+                                    "Line": "Closing bank balance (per bank statement/manual input)",
+                                    "Amount": closing_bank_balance_manual,
+                                }
+                            ]
+                        ),
+                    ],
+                    ignore_index=True,
+                )
+                try:
+                    closing_calc_row_x = cf_summary_all[cf_summary_all["Line"] == "Closing bank balance (from running ledger)"]
+                    if not closing_calc_row_x.empty:
+                        closing_calc_x = float(closing_calc_row_x["Amount"].iloc[0])
+                        diff_manual_x = closing_calc_x - closing_bank_balance_manual
+                        cf_summary_display_excel = pd.concat(
+                            [
+                                cf_summary_display_excel,
+                                pd.DataFrame(
+                                    [
+                                        {
+                                            "Line": "Difference vs manual closing (computed - manual)",
+                                            "Amount": diff_manual_x,
+                                        }
+                                    ]
+                                ),
+                            ],
+                            ignore_index=True,
+                        )
+                except Exception:
+                    pass
+
+                cf_summary_display_excel.to_excel(writer, sheet_name="Cashflow_Summary", index=False)
+                eq_df_all.to_excel(writer, sheet_name="CAC_Equity", index=False)
+
+        excel_buffer.seek(0)
+        st.download_button(
+            label="Download ALL reports (Excel, multi-sheet)",
+            data=excel_buffer,
+            file_name="all_reports.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
 
 
 if __name__ == "__main__":
