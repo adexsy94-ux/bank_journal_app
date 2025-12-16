@@ -1,6 +1,6 @@
 import io
 import re
-from typing import List, Dict, Tuple, Any
+from typing import List, Dict, Any, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -23,8 +23,7 @@ def create_template_df() -> pd.DataFrame:
         "debit",
         "credit",
     ]
-    df = pd.DataFrame(columns=columns)
-    return df
+    return pd.DataFrame(columns=columns)
 
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -38,110 +37,131 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 def _clean_amount_text(x: Any) -> str:
     """
-    Normalize common bank statement amount formats so they can be parsed reliably.
+    Convert any cell to a normalized numeric string that float() can parse.
 
     Handles:
-    - Currency symbols: ₦, NGN, etc.
-    - Thousands separators: commas
-    - Parentheses for negatives: (1,234.00)
-    - DR/CR suffix/prefix: 1000DR, CR1000
-    - Trailing minus: 1000-
-    - Non-breaking spaces
+    - commas, currency symbols (₦, £, $, etc.)
+    - CR/DR text
+    - parentheses for negatives: (1,234.00)
+    - stray characters around numbers
+    - non-breaking spaces
     """
     if x is None:
         return ""
     s = str(x)
 
-    # Normalize spaces (including NBSP)
+    # Normalize weird spaces
     s = s.replace("\u00A0", " ").strip()
 
     if s == "" or s.lower() in {"nan", "none", "null"}:
         return ""
 
-    # Remove currency words/symbols
-    s = s.replace("₦", "")
-    s = re.sub(r"\bNGN\b", "", s, flags=re.IGNORECASE)
+    # parentheses negative: (123.45) => -123.45
+    is_paren_negative = bool(re.match(r"^\s*\(.*\)\s*$", s))
+    s = s.strip("()").strip()
 
-    # Remove spaces
+    # Remove currency and common non-numeric words
+    # Keep digits, dot, minus
+    # Remove commas and spaces first
+    s = s.replace(",", "")
     s = s.replace(" ", "")
 
-    # Detect parentheses negative
-    is_paren_negative = s.startswith("(") and s.endswith(")")
-    if is_paren_negative:
-        s = s[1:-1]
+    # Strip common suffix/prefix like CR/DR
+    s = re.sub(r"(?i)\b(cr|dr)\b", "", s)
 
-    # Detect DR/CR markers (we don't use them for sign; we just strip them)
-    s = re.sub(r"^(DR|CR)", "", s, flags=re.IGNORECASE)
-    s = re.sub(r"(DR|CR)$", "", s, flags=re.IGNORECASE)
+    # Remove any remaining currency symbols and non-number characters
+    s = re.sub(r"[^\d\.\-]", "", s)
 
-    # Trailing minus e.g. 1000-
-    is_trailing_minus = s.endswith("-")
-    if is_trailing_minus:
-        s = s[:-1]
+    # If there are multiple minus signs, keep only the first meaningful one
+    if s.count("-") > 1:
+        s = s.replace("-", "")
+        s = "-" + s
 
-    # Remove commas
-    s = s.replace(",", "")
+    # If there are multiple dots, keep the first dot and remove the rest
+    if s.count(".") > 1:
+        first = s.find(".")
+        s = s[:first + 1] + s[first + 1:].replace(".", "")
 
-    # Keep only valid numeric chars: digits and dot and minus
-    s = re.sub(r"[^0-9.\-]", "", s)
-
-    # Apply negative if parentheses or trailing minus
-    if is_paren_negative or is_trailing_minus:
-        if s and not s.startswith("-"):
-            s = "-" + s
+    if is_paren_negative and s and not s.startswith("-"):
+        s = "-" + s
 
     return s
 
 
-def parse_amount_cell(x: Any) -> Tuple[float, bool]:
+def parse_amount_cell(x: Any) -> Tuple[float, bool, str]:
     """
     Parse a single cell into float.
-    Returns (value, is_valid).
-    - is_valid False means it had content but could not be parsed.
+    Returns (value, is_valid, cleaned_text_for_debug).
+
+    Rules:
+    - Blank is valid and returns 0.
+    - If the raw contains any digits but we can't extract a number, it's invalid.
+    - If the raw contains digits and the parsed value is 0 but raw does NOT look like zero, it's invalid.
     """
     raw = "" if x is None else str(x)
-    raw_stripped = raw.replace("\u00A0", " ").strip()
-    if raw_stripped == "" or raw_stripped.lower() in {"nan", "none", "null"}:
-        return 0.0, True  # blank is fine
+    raw_norm = raw.replace("\u00A0", " ").strip()
+
+    if raw_norm == "" or raw_norm.lower() in {"nan", "none", "null"}:
+        return 0.0, True, ""
 
     cleaned = _clean_amount_text(x)
-    if cleaned == "" or cleaned == "-" or cleaned == ".":
-        return 0.0, False
+
+    has_digits = bool(re.search(r"\d", raw_norm))
+
+    # If original had digits but cleaned is empty => invalid
+    if cleaned in {"", "-", ".", "-.", ".-"}:
+        return 0.0, (not has_digits), cleaned
 
     try:
         val = float(cleaned)
-        return val, True
+
+        # If it parsed to 0 but raw contains digits and raw does not look like a real zero => invalid
+        looks_like_zero = bool(re.fullmatch(r"[₦\s,.\-]*0+(\.0+)?[A-Za-z\s]*", raw_norm))
+        if abs(val) < 1e-12 and has_digits and not looks_like_zero:
+            return 0.0, False, cleaned
+
+        return val, True, cleaned
     except Exception:
-        return 0.0, False
+        return 0.0, False, cleaned
 
 
 def series_to_number_with_audit(series: pd.Series, col_name: str) -> Tuple[pd.Series, pd.DataFrame]:
     """
-    Convert a series to numeric with robust parsing and return an audit table
-    for rows that failed parsing.
+    Convert a series to float, while collecting rows that look like amounts but failed parsing.
+    Returns (parsed_series, bad_cells_df).
     """
-    values = []
-    bad_rows = []
+    values: List[float] = []
+    bad_rows: List[Dict[str, Any]] = []
 
     for idx, x in series.items():
-        val, ok = parse_amount_cell(x)
+        val, ok, cleaned = parse_amount_cell(x)
         values.append(val)
         if not ok:
-            bad_rows.append({"RowIndex": idx, "Column": col_name, "Original": x})
+            bad_rows.append({
+                "RowIndex": idx,
+                "Column": col_name,
+                "Original": x,
+                "Cleaned": cleaned,
+            })
 
     out = pd.Series(values, index=series.index, dtype="float64")
     bad_df = pd.DataFrame(bad_rows)
     return out, bad_df
 
 
+def to_number(series: pd.Series) -> pd.Series:
+    """
+    Backwards compatible numeric conversion for other parts of the code.
+    Uses the robust cell parser but does not emit audit.
+    """
+    parsed, _bad = series_to_number_with_audit(series, col_name="(unknown)")
+    return parsed.fillna(0.0)
+
+
 def classify_cash_flow_type(main_account_type: str) -> str:
     """
     Classify cash flow according to IFRS-style sections based on the MAIN account type
     driving the transaction (not the bank's own account type).
-
-    - Investing: Non-current assets, fixed assets, etc.
-    - Financing: Equity, share capital, reserves, long-term / non-current liabilities.
-    - Operating: All other (revenue, cost of sales, expenses, working capital, etc.)
     """
     if not main_account_type:
         return "Operating"
@@ -169,23 +189,18 @@ def classify_cash_flow_type(main_account_type: str) -> str:
     return "Operating"
 
 
-def generate_journal_rows_with_audit(
+def generate_journal_rows(
     df: pd.DataFrame,
     bank_account_name: str,
     bank_account_type: str,
     suspense_account_name: str,
     suspense_account_type: str
-) -> Tuple[pd.DataFrame, Dict[str, Any], pd.DataFrame]:
+) -> pd.DataFrame:
     """
-    Same journal generation, but returns:
-    - journal_df
-    - audit summary dict
-    - skipped/problem rows dataframe (with reasons)
-
-    Critical: does NOT silently drop rows without reporting why.
+    Generate 4-leg journal entries using Option B (via Suspense).
+    Uses robust parsing for debit/credit.
     """
     rows: List[Dict] = []
-    skipped: List[Dict] = []
 
     col_account_type = "account type"
     col_account = "account"
@@ -196,117 +211,39 @@ def generate_journal_rows_with_audit(
 
     df = df.copy()
 
-    # Ensure columns exist
-    if col_debit not in df.columns:
-        df[col_debit] = ""
-    if col_credit not in df.columns:
-        df[col_credit] = ""
+    # Robust numeric conversion (do NOT silently lose "digit-but-zero" amounts)
+    # Here we treat invalid cells as 0, but we expect UI audit to flag them.
+    if col_debit in df.columns:
+        df[col_debit] = to_number(df[col_debit])
+    else:
+        df[col_debit] = 0.0
 
-    # Parse with audit
-    df["_debit_num"], bad_debit = series_to_number_with_audit(df[col_debit], "debit")
-    df["_credit_num"], bad_credit = series_to_number_with_audit(df[col_credit], "credit")
+    if col_credit in df.columns:
+        df[col_credit] = to_number(df[col_credit])
+    else:
+        df[col_credit] = 0.0
 
-    bad_amounts = pd.concat([bad_debit, bad_credit], ignore_index=True) if (not bad_debit.empty or not bad_credit.empty) else pd.DataFrame()
-
-    total_rows = len(df)
-    processed_rows = 0
-    skipped_rows = 0
-
-    skip_reason_counts = {
-        "ZERO_AMOUNT": 0,
-        "BOTH_DEBIT_AND_CREDIT_FILLED": 0,
-        "AMOUNT_PARSE_ERROR": 0,
-        "MIXED_OR_INCONSISTENT": 0,
-    }
-
-    for idx, row in df.iterrows():
+    for _, row in df.iterrows():
         account_type = str(row.get(col_account_type, "")).strip()
         account_name = str(row.get(col_account, "")).strip()
         date_val = row.get(col_date, "")
         details = str(row.get(col_details, "")).strip()
 
-        debit_raw = row.get(col_debit, "")
-        credit_raw = row.get(col_credit, "")
+        debit = float(row.get(col_debit, 0) or 0)
+        credit = float(row.get(col_credit, 0) or 0)
 
-        debit = float(row.get("_debit_num", 0.0) or 0.0)
-        credit = float(row.get("_credit_num", 0.0) or 0.0)
-
-        # Check whether original had content but parsed to 0 due to error
-        debit_ok = True
-        credit_ok = True
-        # If it appears in bad_amounts for that idx/column, it failed parsing
-        if not bad_amounts.empty:
-            if ((bad_amounts["RowIndex"] == idx) & (bad_amounts["Column"] == "debit")).any():
-                debit_ok = False
-            if ((bad_amounts["RowIndex"] == idx) & (bad_amounts["Column"] == "credit")).any():
-                credit_ok = False
-
-        if not debit_ok or not credit_ok:
-            skipped_rows += 1
-            skip_reason_counts["AMOUNT_PARSE_ERROR"] += 1
-            skipped.append({
-                "RowIndex": idx,
-                "Reason": "AMOUNT_PARSE_ERROR",
-                "start date": date_val,
-                "details": details,
-                "debit_raw": debit_raw,
-                "credit_raw": credit_raw,
-                "debit_parsed": debit,
-                "credit_parsed": credit,
-            })
+        if abs(debit) < 1e-12 and abs(credit) < 1e-12:
             continue
 
-        if debit == 0 and credit == 0:
-            skipped_rows += 1
-            skip_reason_counts["ZERO_AMOUNT"] += 1
-            skipped.append({
-                "RowIndex": idx,
-                "Reason": "ZERO_AMOUNT",
-                "start date": date_val,
-                "details": details,
-                "debit_raw": debit_raw,
-                "credit_raw": credit_raw,
-                "debit_parsed": debit,
-                "credit_parsed": credit,
-            })
-            continue
-
-        # If both sides are filled, don't silently skip—report it
-        if debit > 0 and credit > 0:
-            skipped_rows += 1
-            skip_reason_counts["BOTH_DEBIT_AND_CREDIT_FILLED"] += 1
-            skipped.append({
-                "RowIndex": idx,
-                "Reason": "BOTH_DEBIT_AND_CREDIT_FILLED",
-                "start date": date_val,
-                "details": details,
-                "debit_raw": debit_raw,
-                "credit_raw": credit_raw,
-                "debit_parsed": debit,
-                "credit_parsed": credit,
-            })
-            continue
-
-        # Decide direction
-        if debit > 0 and credit == 0:
+        # Decide direction based on which side has amount
+        if debit > 0 and abs(credit) < 1e-12:
             direction = "out"
             amount = debit
-        elif credit > 0 and debit == 0:
+        elif credit > 0 and abs(debit) < 1e-12:
             direction = "in"
             amount = credit
         else:
-            skipped_rows += 1
-            skip_reason_counts["MIXED_OR_INCONSISTENT"] += 1
-            skipped.append({
-                "RowIndex": idx,
-                "Reason": "MIXED_OR_INCONSISTENT",
-                "start date": date_val,
-                "details": details,
-                "debit_raw": debit_raw,
-                "credit_raw": credit_raw,
-                "debit_parsed": debit,
-                "credit_parsed": credit,
-            })
+            # Mixed row (both sides) – skip for safety
             continue
 
         base_narration = details if details else "Bank transaction"
@@ -316,7 +253,6 @@ def generate_journal_rows_with_audit(
         cf_category = classify_cash_flow_type(main_type_for_cf)
 
         if direction == "out":
-            # Leg 1: Dr Main
             rows.append({
                 "Date": date_val,
                 "Transaction / Details": base_narration,
@@ -328,7 +264,6 @@ def generate_journal_rows_with_audit(
                 "Narration": f"Record {account_name or 'expense'} for {short_narr}",
                 "Cash Flow Category": "",
             })
-            # Leg 2: Cr Suspense
             rows.append({
                 "Date": date_val,
                 "Transaction / Details": base_narration,
@@ -340,7 +275,6 @@ def generate_journal_rows_with_audit(
                 "Narration": "Temporary posting of payment to suspense",
                 "Cash Flow Category": "",
             })
-            # Leg 3: Dr Suspense
             rows.append({
                 "Date": date_val,
                 "Transaction / Details": base_narration,
@@ -352,7 +286,6 @@ def generate_journal_rows_with_audit(
                 "Narration": "Clear suspense against bank movement",
                 "Cash Flow Category": "",
             })
-            # Leg 4: Cr Bank
             rows.append({
                 "Date": date_val,
                 "Transaction / Details": base_narration,
@@ -365,7 +298,6 @@ def generate_journal_rows_with_audit(
                 "Cash Flow Category": cf_category,
             })
         else:
-            # Leg 1: Dr Suspense
             rows.append({
                 "Date": date_val,
                 "Transaction / Details": base_narration,
@@ -377,7 +309,6 @@ def generate_journal_rows_with_audit(
                 "Narration": "Temporary posting of receipt to suspense",
                 "Cash Flow Category": "",
             })
-            # Leg 2: Cr Main
             rows.append({
                 "Date": date_val,
                 "Transaction / Details": base_narration,
@@ -389,7 +320,6 @@ def generate_journal_rows_with_audit(
                 "Narration": f"Record {account_name or 'income'} for {short_narr}",
                 "Cash Flow Category": "",
             })
-            # Leg 3: Dr Bank
             rows.append({
                 "Date": date_val,
                 "Transaction / Details": base_narration,
@@ -401,7 +331,6 @@ def generate_journal_rows_with_audit(
                 "Narration": "Bank receipt from suspense",
                 "Cash Flow Category": cf_category,
             })
-            # Leg 4: Cr Suspense
             rows.append({
                 "Date": date_val,
                 "Transaction / Details": base_narration,
@@ -414,30 +343,15 @@ def generate_journal_rows_with_audit(
                 "Cash Flow Category": "",
             })
 
-        processed_rows += 1
-
     journal_df = pd.DataFrame(rows)
     if not journal_df.empty:
         journal_df = journal_df.sort_values(by=["Date", "Leg"]).reset_index(drop=True)
-
-    skipped_df = pd.DataFrame(skipped)
-
-    audit = {
-        "total_statement_rows": total_rows,
-        "processed_statement_rows": processed_rows,
-        "skipped_statement_rows": skipped_rows,
-        "skip_reason_counts": skip_reason_counts,
-        "amount_parse_errors_count": int(skip_reason_counts["AMOUNT_PARSE_ERROR"]),
-    }
-
-    return journal_df, audit, skipped_df
+    return journal_df
 
 
 def load_uploaded_file(uploaded_file) -> pd.DataFrame:
     """
     Robust reader for CSV / Excel uploaded via Streamlit.
-    - Excel: use pandas.read_excel directly.
-    - CSV: try several encodings to avoid 'utf-8' codec errors.
     """
     file_name = uploaded_file.name.lower()
 
@@ -452,8 +366,7 @@ def load_uploaded_file(uploaded_file) -> pd.DataFrame:
     for enc in encodings_to_try:
         try:
             text = raw_bytes.decode(enc)
-            df = pd.read_csv(io.StringIO(text))
-            return df
+            return pd.read_csv(io.StringIO(text))
         except UnicodeDecodeError as e:
             last_error = e
             continue
@@ -493,12 +406,7 @@ def build_trial_balance(journal_df: pd.DataFrame) -> pd.DataFrame:
     total_debit = tb["Debit"].sum()
     total_credit = tb["Credit"].sum()
     totals_row = pd.DataFrame(
-        {
-            "Account Type": ["TOTAL"],
-            "Account": [""],
-            "Debit": [total_debit],
-            "Credit": [total_credit],
-        }
+        {"Account Type": ["TOTAL"], "Account": [""], "Debit": [total_debit], "Credit": [total_credit]}
     )
     tb = pd.concat([tb, totals_row], ignore_index=True)
     return tb
@@ -514,7 +422,6 @@ def build_gl_detail(journal_df: pd.DataFrame) -> pd.DataFrame:
 
 def build_income_statement(tb_with_totals: pd.DataFrame):
     tb = tb_with_totals[tb_with_totals["Account Type"] != "TOTAL"].copy()
-
     tb["NetImpact"] = tb["Credit"] - tb["Debit"]
     tb["Account Type Lower"] = tb["Account Type"].astype(str).str.lower()
 
@@ -534,14 +441,13 @@ def build_income_statement(tb_with_totals: pd.DataFrame):
     gross_profit = total_revenue - total_cos
     net_profit = gross_profit - total_expenses
 
-    summary_rows = [
+    summary_df = pd.DataFrame([
         {"Line": "Total Revenue", "Amount": total_revenue},
         {"Line": "Cost of Sales", "Amount": total_cos},
         {"Line": "Gross Profit", "Amount": gross_profit},
         {"Line": "Operating Expenses", "Amount": total_expenses},
         {"Line": "Net Profit / (Loss)", "Amount": net_profit},
-    ]
-    summary_df = pd.DataFrame(summary_rows)
+    ])
 
     return revenue_df, cos_df, expense_df, summary_df
 
@@ -555,13 +461,11 @@ def build_balance_sheet(tb_with_totals: pd.DataFrame) -> Dict[str, pd.DataFrame]
         if "asset" in t:
             if any(k in t for k in ["non current", "non-current", "noncurrent", "fixed"]):
                 return "Non-Current Asset"
-            else:
-                return "Current Asset"
+            return "Current Asset"
         if "liab" in t:
             if any(k in t for k in ["non current", "non-current", "noncurrent", "long term", "long-term"]):
                 return "Non-Current Liability"
-            else:
-                return "Current Liability"
+            return "Current Liability"
         if any(k in t for k in ["equity", "capital", "retained", "reserve", "share capital"]):
             return "Equity"
         return "Other"
@@ -571,10 +475,9 @@ def build_balance_sheet(tb_with_totals: pd.DataFrame) -> Dict[str, pd.DataFrame]
     def bs_balance(row):
         if row["BS_Category"] in ["Current Asset", "Non-Current Asset"]:
             return row["Debit"] - row["Credit"]
-        elif row["BS_Category"] in ["Current Liability", "Non-Current Liability", "Equity"]:
+        if row["BS_Category"] in ["Current Liability", "Non-Current Liability", "Equity"]:
             return row["Credit"] - row["Debit"]
-        else:
-            return row["Credit"] - row["Debit"]
+        return row["Credit"] - row["Debit"]
 
     tb["Balance"] = tb.apply(bs_balance, axis=1)
 
@@ -599,7 +502,6 @@ def append_opening_balance_journal(
 
     df_dates = ensure_journal_dates(journal_df)
     valid_dates = df_dates["Date_dt"].dropna()
-
     if valid_dates.empty:
         return journal_df
 
@@ -665,11 +567,22 @@ def append_opening_balance_journal(
     return combined
 
 
+# -----------------------------
+# CASHFLOW (FIXED + AUDIT-FRIENDLY)
+# -----------------------------
+
 def build_cashbook_ifrs(
     journal_df: pd.DataFrame,
     bank_account_name: str,
-    opening_balance: float  # kept in signature; opening comes from journal entry
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    opening_balance: float  # kept in signature; actual opening comes from journal
+) -> (pd.DataFrame, pd.DataFrame):
+    """
+    IFRS-style cashflow based on bank account movements.
+
+    Fixes:
+    - Adds an "Other / Unclassified" bucket so *all non-opening movements* reconcile to closing.
+    - Uses "Net change (all non-opening)" for reconciliation so Difference truly should be 0.
+    """
     df = ensure_journal_dates(journal_df)
 
     cb = df[df["Account"] == bank_account_name].copy()
@@ -681,7 +594,7 @@ def build_cashbook_ifrs(
     cb["Cash_Movement"] = cb["Dr Amount"] - cb["Cr Amount"]
 
     if "Cash Flow Category" in cb.columns:
-        cf_cat = cb["Cash Flow Category"].fillna("")
+        cf_cat = cb["Cash Flow Category"].fillna("").astype(str)
         cf_cat = cf_cat.replace("", "Operating")
         cb["Cash Flow Category"] = cf_cat
     else:
@@ -697,9 +610,16 @@ def build_cashbook_ifrs(
     investing_total = cb.loc[cb["Cash Flow Category"] == "Investing", "Cash_Movement"].sum()
     financing_total = cb.loc[cb["Cash Flow Category"] == "Financing", "Cash_Movement"].sum()
 
-    net_change = operating_total + investing_total + financing_total
-    closing_balance_calc = opening_journal_balance + net_change
+    # Anything not Opening/Operating/Investing/Financing becomes "Other" for reconciliation
+    known = {"Opening Balance", "Operating", "Investing", "Financing"}
+    other_total = cb.loc[~cb["Cash Flow Category"].isin(list(known)), "Cash_Movement"].sum()
 
+    # Net change should include ALL non-opening movements
+    net_change_all_non_opening = cb.loc[
+        cb["Cash Flow Category"] != "Opening Balance", "Cash_Movement"
+    ].sum()
+
+    closing_balance_calc = opening_journal_balance + net_change_all_non_opening
     closing_balance_running = cb["Running_Cash_Balance"].iloc[-1]
     diff = closing_balance_calc - closing_balance_running
 
@@ -707,7 +627,8 @@ def build_cashbook_ifrs(
         {"Line": "Net cash from Operating activities", "Amount": operating_total},
         {"Line": "Net cash from Investing activities", "Amount": investing_total},
         {"Line": "Net cash from Financing activities", "Amount": financing_total},
-        {"Line": "Net increase / (decrease) in cash", "Amount": net_change},
+        {"Line": "Other / Unclassified cash movements", "Amount": other_total},
+        {"Line": "Net increase / (decrease) in cash (all non-opening)", "Amount": net_change_all_non_opening},
         {"Line": "Opening bank balance (per journal Opening Balance entry)", "Amount": opening_journal_balance},
         {"Line": "Closing bank balance (Opening + Net cash)", "Amount": closing_balance_calc},
         {"Line": "Closing bank balance (from running ledger)", "Amount": closing_balance_running},
@@ -752,13 +673,12 @@ using a **Suspense Account** in between (Option B), then builds:
 - 📈 Income Statement (Revenue, Cost of Sales, Gross Profit, Expenses, Net Profit)
 - 📗 Statement of Financial Position (Balance Sheet – template style)
 - 💵 IFRS-style Cashflow (Operating, Investing, Financing) + reconciled bank balance
-
-✅ This version includes a **Processing Audit** so you can see how many statement lines were processed and why any were skipped.
         """
     )
 
     st.markdown("---")
 
+    # Sidebar settings
     st.sidebar.header("Settings")
 
     bank_account_name = st.sidebar.text_input(
@@ -801,6 +721,24 @@ using a **Suspense Account** in between (Option B), then builds:
     )
 
     st.sidebar.markdown("---")
+    st.sidebar.header("Optional Statement Totals (for audit)")
+
+    expected_total_debit = st.sidebar.number_input(
+        "Expected Total Debit (from statement)",
+        min_value=0.0,
+        value=0.0,
+        step=1000.0,
+        help="Optional. If entered, app will compare parsed totals vs your statement totals."
+    )
+    expected_total_credit = st.sidebar.number_input(
+        "Expected Total Credit (from statement)",
+        min_value=0.0,
+        value=0.0,
+        step=1000.0,
+        help="Optional. If entered, app will compare parsed totals vs your statement totals."
+    )
+
+    st.sidebar.markdown("---")
     st.sidebar.header("CAC / Equity Inputs")
 
     number_of_shares = st.sidebar.number_input(
@@ -826,9 +764,7 @@ using a **Suspense Account** in between (Option B), then builds:
     )
     computed_share_capital = number_of_shares * nominal_value_per_share
 
-    # -------------------------
     # Template Download
-    # -------------------------
     st.subheader("1️⃣ Download Bank Statement Template")
 
     template_df = create_template_df()
@@ -844,11 +780,10 @@ using a **Suspense Account** in between (Option B), then builds:
 
     st.markdown("**Template columns:**")
     st.dataframe(template_df.head(0))
+
     st.markdown("---")
 
-    # -------------------------
     # File Upload
-    # -------------------------
     st.subheader("2️⃣ Upload Completed Bank Statement (CSV or Excel)")
 
     uploaded_file = st.file_uploader(
@@ -875,12 +810,13 @@ using a **Suspense Account** in between (Option B), then builds:
         original_dates = df_norm["start date"]
         parsed_dates_full = pd.to_datetime(original_dates, errors="coerce", dayfirst=True)
 
-        non_empty_mask = original_dates.astype(str).str.replace("\u00A0", " ").str.strip() != ""
+        non_empty_mask = original_dates.astype(str).str.replace("\u00A0", " ", regex=False).str.strip() != ""
         invalid_mask = non_empty_mask & parsed_dates_full.isna()
 
         if invalid_mask.any():
             invalid_rows = df_norm.loc[invalid_mask, ["start date"]].copy()
             invalid_rows["Row_Number_in_File"] = invalid_rows.index + 2
+
             st.error(
                 "⚠️ Some rows have invalid dates in the 'start date' column. "
                 "Please correct them in your Excel/CSV and re-upload."
@@ -888,11 +824,14 @@ using a **Suspense Account** in between (Option B), then builds:
             st.markdown("Below are the first few problematic rows (Excel row number & value):")
             st.dataframe(invalid_rows[["Row_Number_in_File", "start date"]].head(50))
             st.stop()
+    else:
+        st.warning("Column 'start date' not found. Date filter disabled.")
 
+    # Date Filter Section
     st.markdown("---")
     st.subheader("3️⃣ Choose Date(s) for Journal Preparation")
 
-    filtered_df = df_norm
+    filtered_df = df_norm.copy()
 
     if "start date" in df_norm.columns:
         parsed_dates = pd.to_datetime(df_norm["start date"], errors="coerce", dayfirst=True)
@@ -945,62 +884,96 @@ using a **Suspense Account** in between (Option B), then builds:
         st.warning("Column 'start date' not found. Date filter disabled.")
 
     # -------------------------
-    # Processing Audit (BEFORE journal)
+    # AUDIT: amounts parsing + missing money detection
     # -------------------------
     st.markdown("---")
-    st.subheader("✅ Processing Audit (How many lines were processed?)")
+    st.subheader("3️⃣A Amount Parsing Audit (to catch missing ₦)")
 
-    # Compute filtered totals (using same robust parsing)
-    if "debit" in filtered_df.columns:
-        debit_nums, debit_bad = series_to_number_with_audit(filtered_df["debit"], "debit")
-    else:
-        debit_nums, debit_bad = pd.Series([0.0] * len(filtered_df), index=filtered_df.index), pd.DataFrame()
+    # Ensure columns exist
+    if "debit" not in filtered_df.columns:
+        filtered_df["debit"] = ""
+    if "credit" not in filtered_df.columns:
+        filtered_df["credit"] = ""
 
-    if "credit" in filtered_df.columns:
-        credit_nums, credit_bad = series_to_number_with_audit(filtered_df["credit"], "credit")
-    else:
-        credit_nums, credit_bad = pd.Series([0.0] * len(filtered_df), index=filtered_df.index), pd.DataFrame()
+    debit_nums, bad_debit = series_to_number_with_audit(filtered_df["debit"], "debit")
+    credit_nums, bad_credit = series_to_number_with_audit(filtered_df["credit"], "credit")
 
-    filtered_total_debit = float(debit_nums.sum() or 0.0)
-    filtered_total_credit = float(credit_nums.sum() or 0.0)
-    filtered_net = filtered_total_credit - filtered_total_debit
+    filtered_total_debit = float(debit_nums.sum() or 0)
+    filtered_total_credit = float(credit_nums.sum() or 0)
 
-    audit_top = pd.DataFrame([
-        {"Metric": "Filtered statement rows", "Value": len(filtered_df)},
-        {"Metric": "Filtered total debit (parsed)", "Value": filtered_total_debit},
-        {"Metric": "Filtered total credit (parsed)", "Value": filtered_total_credit},
-        {"Metric": "Filtered net (credit - debit)", "Value": filtered_net},
-    ])
-    st.dataframe(audit_top)
+    # Rows processed by direction logic (what journal will accept)
+    only_debit = (debit_nums > 0) & (credit_nums.abs() < 1e-12)
+    only_credit = (credit_nums > 0) & (debit_nums.abs() < 1e-12)
+    both_nonzero = (debit_nums > 0) & (credit_nums > 0)
+    both_zero = (debit_nums.abs() < 1e-12) & (credit_nums.abs() < 1e-12)
 
-    bad_any = pd.concat([debit_bad, credit_bad], ignore_index=True) if (not debit_bad.empty or not credit_bad.empty) else pd.DataFrame()
-    if not bad_any.empty:
-        st.error("⚠️ Some debit/credit cells could NOT be parsed into numbers. Those rows can cause missing cashflow totals.")
-        bad_any = bad_any.copy()
-        bad_any["Row_Number_in_File"] = bad_any["RowIndex"] + 2
-        st.dataframe(bad_any[["Row_Number_in_File", "Column", "Original"]].head(100))
+    st.write(
+        f"""
+**Parsed totals (selected rows only):**
+- Total Debit (parsed): **{filtered_total_debit:,.2f}**
+- Total Credit (parsed): **{filtered_total_credit:,.2f}**
 
-        bad_csv = io.StringIO()
-        bad_any.to_csv(bad_csv, index=False)
-        st.download_button(
-            label="Download amount-parse errors (CSV)",
-            data=bad_csv.getvalue(),
-            file_name="amount_parse_errors.csv",
-            mime="text/csv",
-        )
+**Row classification (selected rows only):**
+- Rows with *only debit*: **{int(only_debit.sum())}**
+- Rows with *only credit*: **{int(only_credit.sum())}**
+- Rows with *both debit and credit non-zero* (will be skipped): **{int(both_nonzero.sum())}**
+- Rows with *both zero* (will be skipped): **{int(both_zero.sum())}**
+        """
+    )
 
-    # -------------------------
-    # Generate Journal (WITH audit)
-    # -------------------------
-    journal_df, journal_audit, skipped_df = generate_journal_rows_with_audit(
-        filtered_df,
+    if expected_total_debit > 0:
+        st.write(f"Statement Total Debit (expected): **{expected_total_debit:,.2f}** | Diff: **{(filtered_total_debit - expected_total_debit):,.2f}**")
+    if expected_total_credit > 0:
+        st.write(f"Statement Total Credit (expected): **{expected_total_credit:,.2f}** | Diff: **{(filtered_total_credit - expected_total_credit):,.2f}**")
+
+    # Show invalid cells (digits present but cannot parse cleanly)
+    bad_all = pd.concat([bad_debit, bad_credit], ignore_index=True)
+    if not bad_all.empty:
+        bad_all = bad_all.copy()
+        bad_all["Row_Number_in_File"] = bad_all["RowIndex"] + 2
+        st.error("⚠️ Some debit/credit cells contain digits but could not be parsed correctly. These can create missing totals.")
+        st.dataframe(bad_all[["Row_Number_in_File", "Column", "Original", "Cleaned"]].head(200))
+
+    # Detect “digits present but parsed as 0” (very common with ₦ + hidden characters)
+    def find_digit_but_zero(df_in: pd.DataFrame, col: str, parsed: pd.Series) -> pd.DataFrame:
+        raw = df_in[col].astype(str).replace("\u00A0", " ", regex=False).str.strip()
+        has_digits = raw.str.contains(r"\d", regex=True, na=False)
+        looks_blank = raw.isin(["", "nan", "None", "null"])
+        looks_zero = raw.str.fullmatch(r"[₦\s,.\-]*0+(\.0+)?[A-Za-z\s]*", na=False)
+        mask = has_digits & (~looks_blank) & (parsed.abs() < 1e-12) & (~looks_zero)
+        if not mask.any():
+            return pd.DataFrame()
+        out = df_in.loc[mask, ["start date", "details", col]].copy()
+        out.rename(columns={col: f"{col}_raw"}, inplace=True)
+        out["Row_Number_in_File"] = out.index + 2
+        return out
+
+    credit_digit_zero = find_digit_but_zero(filtered_df, "credit", credit_nums)
+    debit_digit_zero = find_digit_but_zero(filtered_df, "debit", debit_nums)
+
+    if not credit_digit_zero.empty or not debit_digit_zero.empty:
+        st.error("⚠️ Found rows that contain digits but were parsed as 0. These are the most likely source of your missing ₦.")
+        if not credit_digit_zero.empty:
+            st.markdown("#### Suspect CREDIT rows (digits present, parsed=0)")
+            st.dataframe(credit_digit_zero.head(200))
+        if not debit_digit_zero.empty:
+            st.markdown("#### Suspect DEBIT rows (digits present, parsed=0)")
+            st.dataframe(debit_digit_zero.head(200))
+
+    # Build df for journal using parsed numbers (prevents re-parsing differences)
+    df_for_journal = filtered_df.copy()
+    df_for_journal["debit"] = debit_nums
+    df_for_journal["credit"] = credit_nums
+
+    # Generate Journal
+    journal_df = generate_journal_rows(
+        df_for_journal,
         bank_account_name=bank_account_name,
         bank_account_type=bank_account_type,
         suspense_account_name=suspense_account_name,
         suspense_account_type=suspense_account_type,
     )
 
-    # Append opening balance
     journal_df = append_opening_balance_journal(
         journal_df,
         bank_account_name=bank_account_name,
@@ -1008,45 +981,14 @@ using a **Suspense Account** in between (Option B), then builds:
         opening_balance=opening_bank_balance,
     )
 
-    # Show journal audit summary
-    audit_summary_rows = [
-        {"Metric": "Statement rows in filtered period", "Value": journal_audit["total_statement_rows"]},
-        {"Metric": "Statement rows processed into journals", "Value": journal_audit["processed_statement_rows"]},
-        {"Metric": "Statement rows skipped", "Value": journal_audit["skipped_statement_rows"]},
-        {"Metric": "Skipped: ZERO_AMOUNT", "Value": journal_audit["skip_reason_counts"]["ZERO_AMOUNT"]},
-        {"Metric": "Skipped: BOTH_DEBIT_AND_CREDIT_FILLED", "Value": journal_audit["skip_reason_counts"]["BOTH_DEBIT_AND_CREDIT_FILLED"]},
-        {"Metric": "Skipped: AMOUNT_PARSE_ERROR", "Value": journal_audit["skip_reason_counts"]["AMOUNT_PARSE_ERROR"]},
-        {"Metric": "Skipped: MIXED_OR_INCONSISTENT", "Value": journal_audit["skip_reason_counts"]["MIXED_OR_INCONSISTENT"]},
-    ]
-    st.dataframe(pd.DataFrame(audit_summary_rows))
-
-    if not skipped_df.empty:
-        st.warning("Some statement rows were skipped. Review below (this is often the exact reason for cashflow differences).")
-        show_cols = [c for c in ["RowIndex", "Reason", "start date", "details", "debit_raw", "credit_raw", "debit_parsed", "credit_parsed"] if c in skipped_df.columns]
-        view_df = skipped_df.copy()
-        view_df["Row_Number_in_File"] = view_df["RowIndex"] + 2
-        cols = ["Row_Number_in_File"] + [c for c in show_cols if c != "RowIndex"]
-        st.dataframe(view_df[cols].head(200))
-
-        skip_csv = io.StringIO()
-        view_df.to_csv(skip_csv, index=False)
-        st.download_button(
-            label="Download skipped rows report (CSV)",
-            data=skip_csv.getvalue(),
-            file_name="skipped_rows_report.csv",
-            mime="text/csv",
-        )
-    else:
-        st.success("✅ No statement rows were skipped by the journal processor.")
-
     st.markdown("---")
     st.subheader("4️⃣ Reports from Journal")
 
     if journal_df.empty:
-        st.warning("No valid rows found to convert (check DEBIT/CREDIT, dates, and template columns).")
+        st.warning("No valid rows found to convert (check debit/credit values, date filter, and template columns).")
         return
 
-    # Precompute shared reports
+    # Precompute reports
     gl_df_all = build_gl_detail(journal_df)
     tb_df_all = build_trial_balance(journal_df)
     revenue_df_all, cos_df_all, expense_df_all, is_summary_df_all = build_income_statement(tb_df_all)
@@ -1057,7 +999,7 @@ using a **Suspense Account** in between (Option B), then builds:
         opening_balance=opening_bank_balance
     )
 
-    # Balance Sheet layout build
+    # Balance Sheet layout + CAC summary
     current_assets_all = bs_dict_all["current_assets"]
     noncurrent_assets_all = bs_dict_all["noncurrent_assets"]
     current_liabilities_all = bs_dict_all["current_liabilities"]
@@ -1103,6 +1045,7 @@ using a **Suspense Account** in between (Option B), then builds:
     bs_rows_all.append({"Section": "Total Assets", "Account": "", "Amount": total_assets_all})
 
     bs_rows_all.append({"Section": "", "Account": "", "Amount": ""})
+
     bs_rows_all.append({"Section": "LIABILITIES AND CAPITAL", "Account": "", "Amount": ""})
 
     bs_rows_all.append({"Section": "Current Liabilities", "Account": "", "Amount": ""})
@@ -1127,18 +1070,18 @@ using a **Suspense Account** in between (Option B), then builds:
 
     bs_layout_df_all = pd.DataFrame(bs_rows_all, columns=["Section", "Account", "Amount"])
 
-    eq_rows_all = [
+    eq_df_all = pd.DataFrame([
         {"Line": "Number of shares", "Amount": number_of_shares},
         {"Line": "Nominal value per share", "Amount": nominal_value_per_share},
         {"Line": "Computed Share Capital (CAC)", "Amount": computed_share_capital},
         {"Line": "Share Premium / Other CAC Equity", "Amount": share_premium_other},
         {"Line": "Net Income (from Income Statement)", "Amount": net_income_all},
         {"Line": "Ledger Equity balances (sum of equity accounts)", "Amount": total_equity_ledger_all},
-    ]
-    eq_df_all = pd.DataFrame(eq_rows_all)
+    ])
 
     tab_journal, tab_gl, tab_tb, tab_is, tab_bs, tab_cf = st.tabs(
-        ["📄 Journal", "📘 General Ledger", "📊 Trial Balance", "📈 Income Statement", "📗 Statement of Financial Position", "💵 Cashflow (IFRS)"]
+        ["📄 Journal", "📘 General Ledger", "📊 Trial Balance", "📈 Income Statement",
+         "📗 Statement of Financial Position", "💵 Cashflow (IFRS)"]
     )
 
     with tab_journal:
@@ -1164,22 +1107,10 @@ using a **Suspense Account** in between (Option B), then builds:
         if selected_account != "(All)":
             gl_display = gl_display[gl_display["Account"] == selected_account]
 
-        st.dataframe(
-            gl_display[
-                [
-                    "Date",
-                    "Transaction / Details",
-                    "Leg",
-                    "Account Type",
-                    "Account",
-                    "Dr Amount",
-                    "Cr Amount",
-                    "Amount_Signed",
-                    "Running_Balance",
-                    "Narration",
-                ]
-            ]
-        )
+        st.dataframe(gl_display[
+            ["Date", "Transaction / Details", "Leg", "Account Type", "Account",
+             "Dr Amount", "Cr Amount", "Amount_Signed", "Running_Balance", "Narration"]
+        ])
 
         gl_csv = io.StringIO()
         gl_display.to_csv(gl_csv, index=False)
@@ -1307,24 +1238,6 @@ using a **Suspense Account** in between (Option B), then builds:
                 mime="text/csv",
             )
 
-            # Add reconciliation context
-            st.markdown("#### Reconciliation Totals (Sanity Check)")
-            bank_inflow = float(cashbook_df_all["Dr Amount"].sum() or 0.0)
-            bank_outflow = float(cashbook_df_all["Cr Amount"].sum() or 0.0)
-            bank_net = bank_inflow - bank_outflow
-
-            recon_df = pd.DataFrame([
-                {"Metric": "Bank-leg inflow (sum Dr Amount)", "Value": bank_inflow},
-                {"Metric": "Bank-leg outflow (sum Cr Amount)", "Value": bank_outflow},
-                {"Metric": "Bank-leg net (inflow - outflow)", "Value": bank_net},
-                {"Metric": "Filtered statement net (credit - debit)", "Value": filtered_net},
-                {"Metric": "Difference (bank-leg net - filtered net)", "Value": bank_net - filtered_net},
-                {"Metric": "Statement rows processed", "Value": journal_audit["processed_statement_rows"]},
-                {"Metric": "Statement rows skipped", "Value": journal_audit["skipped_statement_rows"]},
-            ])
-            st.dataframe(recon_df)
-
-            # Build summary display with manual closing comparison
             cf_summary_display = cf_summary_all.copy()
             cf_summary_display = pd.concat(
                 [
@@ -1367,17 +1280,8 @@ using a **Suspense Account** in between (Option B), then builds:
                     st.error(
                         f"❌ Computed closing bank balance ({closing_calc:,.2f}) does NOT match "
                         f"manual closing balance ({closing_bank_balance_manual:,.2f}). "
-                        f"Difference: {difference_manual:,.2f}.\n\n"
-                        "Now you can locate the cause using:\n"
-                        "• Processing Audit (skipped rows report)\n"
-                        "• Amount-parse errors report\n"
-                        "• Reconciliation Totals (bank-leg net vs filtered net)\n"
+                        f"Difference: {difference_manual:,.2f}."
                     )
-            else:
-                st.info(
-                    "Could not determine computed closing bank balance for comparison. "
-                    "Check that the cashflow summary contains the closing balance line."
-                )
 
             st.markdown("#### Cashflow Summary (Operating / Investing / Financing)")
             st.dataframe(cf_summary_display)
@@ -1391,9 +1295,22 @@ using a **Suspense Account** in between (Option B), then builds:
                 mime="text/csv",
             )
 
-    # -------------------------
-    # Download all reports as one Excel
-    # -------------------------
+            # Quick “what did we actually process” audit (bank movements vs statement lines)
+            with st.expander("🔎 Cashflow processing audit (counts & what got skipped)"):
+                st.write("These counts are based on the selected rows after date filtering and robust parsing.")
+                st.write({
+                    "Selected rows (after date filter)": int(len(filtered_df)),
+                    "Rows accepted as payments (debit only)": int(only_debit.sum()),
+                    "Rows accepted as receipts (credit only)": int(only_credit.sum()),
+                    "Rows skipped (both debit & credit non-zero)": int(both_nonzero.sum()),
+                    "Rows skipped (both zero after parsing)": int(both_zero.sum()),
+                    "Bad debit cells (digits but invalid parse)": int(len(bad_debit)),
+                    "Bad credit cells (digits but invalid parse)": int(len(bad_credit)),
+                    "Credit digits-but-zero candidates": int(len(credit_digit_zero)) if isinstance(credit_digit_zero, pd.DataFrame) else 0,
+                    "Debit digits-but-zero candidates": int(len(debit_digit_zero)) if isinstance(debit_digit_zero, pd.DataFrame) else 0,
+                })
+
+    # Download all reports as Excel
     st.markdown("### ⬇️ Download ALL reports as one Excel file (multiple sheets)")
 
     excel_buffer = io.BytesIO()
@@ -1409,47 +1326,35 @@ using a **Suspense Account** in between (Option B), then builds:
             is_summary_df_all.to_excel(writer, sheet_name="IS_Summary", index=False)
             bs_layout_df_all.to_excel(writer, sheet_name="BS_Layout", index=False)
             cashbook_df_all.to_excel(writer, sheet_name="Cashbook", index=False)
-
-            cf_summary_display_excel = cf_summary_all.copy()
-            cf_summary_display_excel = pd.concat(
-                [
-                    cf_summary_display_excel,
-                    pd.DataFrame([{
-                        "Line": "Closing bank balance (per bank statement/manual input)",
-                        "Amount": closing_bank_balance_manual,
-                    }]),
-                ],
-                ignore_index=True,
-            )
-
-            try:
-                closing_calc_row_x = cf_summary_all[cf_summary_all["Line"] == "Closing bank balance (from running ledger)"]
-                if not closing_calc_row_x.empty:
-                    closing_calc_x = float(closing_calc_row_x["Amount"].iloc[0])
-                    diff_manual_x = closing_calc_x - closing_bank_balance_manual
-                    cf_summary_display_excel = pd.concat(
-                        [
-                            cf_summary_display_excel,
-                            pd.DataFrame([{
-                                "Line": "Difference vs manual closing (computed - manual)",
-                                "Amount": diff_manual_x,
-                            }]),
-                        ],
-                        ignore_index=True,
-                    )
-            except Exception:
-                pass
-
-            cf_summary_display_excel.to_excel(writer, sheet_name="Cashflow_Summary", index=False)
+            cf_summary_all.to_excel(writer, sheet_name="Cashflow_Summary_Base", index=False)
             eq_df_all.to_excel(writer, sheet_name="CAC_Equity", index=False)
 
-            # Add diagnostics sheets
-            audit_top.to_excel(writer, sheet_name="Audit_Totals", index=False)
-            pd.DataFrame(audit_summary_rows).to_excel(writer, sheet_name="Audit_Counts", index=False)
-            if not bad_any.empty:
-                bad_any.to_excel(writer, sheet_name="Amount_Parse_Errors", index=False)
-            if not skipped_df.empty:
-                skipped_df.to_excel(writer, sheet_name="Skipped_Rows", index=False)
+            # Add audit sheets
+            pd.DataFrame({
+                "Metric": [
+                    "Parsed Total Debit (selected)",
+                    "Parsed Total Credit (selected)",
+                    "Expected Total Debit",
+                    "Expected Total Credit",
+                    "Diff Debit (parsed - expected)",
+                    "Diff Credit (parsed - expected)",
+                ],
+                "Value": [
+                    filtered_total_debit,
+                    filtered_total_credit,
+                    expected_total_debit,
+                    expected_total_credit,
+                    filtered_total_debit - expected_total_debit if expected_total_debit else 0.0,
+                    filtered_total_credit - expected_total_credit if expected_total_credit else 0.0,
+                ]
+            }).to_excel(writer, sheet_name="Amount_Audit_Summary", index=False)
+
+            if not bad_all.empty:
+                bad_all.to_excel(writer, sheet_name="Bad_Amount_Cells", index=False)
+            if isinstance(credit_digit_zero, pd.DataFrame) and not credit_digit_zero.empty:
+                credit_digit_zero.to_excel(writer, sheet_name="Credit_DigitZero", index=False)
+            if isinstance(debit_digit_zero, pd.DataFrame) and not debit_digit_zero.empty:
+                debit_digit_zero.to_excel(writer, sheet_name="Debit_DigitZero", index=False)
 
     except ImportError:
         with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
@@ -1462,45 +1367,34 @@ using a **Suspense Account** in between (Option B), then builds:
             is_summary_df_all.to_excel(writer, sheet_name="IS_Summary", index=False)
             bs_layout_df_all.to_excel(writer, sheet_name="BS_Layout", index=False)
             cashbook_df_all.to_excel(writer, sheet_name="Cashbook", index=False)
-
-            cf_summary_display_excel = cf_summary_all.copy()
-            cf_summary_display_excel = pd.concat(
-                [
-                    cf_summary_display_excel,
-                    pd.DataFrame([{
-                        "Line": "Closing bank balance (per bank statement/manual input)",
-                        "Amount": closing_bank_balance_manual,
-                    }]),
-                ],
-                ignore_index=True,
-            )
-            try:
-                closing_calc_row_x = cf_summary_all[cf_summary_all["Line"] == "Closing bank balance (from running ledger)"]
-                if not closing_calc_row_x.empty:
-                    closing_calc_x = float(closing_calc_row_x["Amount"].iloc[0])
-                    diff_manual_x = closing_calc_x - closing_bank_balance_manual
-                    cf_summary_display_excel = pd.concat(
-                        [
-                            cf_summary_display_excel,
-                            pd.DataFrame([{
-                                "Line": "Difference vs manual closing (computed - manual)",
-                                "Amount": diff_manual_x,
-                            }]),
-                        ],
-                        ignore_index=True,
-                    )
-            except Exception:
-                pass
-
-            cf_summary_display_excel.to_excel(writer, sheet_name="Cashflow_Summary", index=False)
+            cf_summary_all.to_excel(writer, sheet_name="Cashflow_Summary_Base", index=False)
             eq_df_all.to_excel(writer, sheet_name="CAC_Equity", index=False)
 
-            audit_top.to_excel(writer, sheet_name="Audit_Totals", index=False)
-            pd.DataFrame(audit_summary_rows).to_excel(writer, sheet_name="Audit_Counts", index=False)
-            if not bad_any.empty:
-                bad_any.to_excel(writer, sheet_name="Amount_Parse_Errors", index=False)
-            if not skipped_df.empty:
-                skipped_df.to_excel(writer, sheet_name="Skipped_Rows", index=False)
+            pd.DataFrame({
+                "Metric": [
+                    "Parsed Total Debit (selected)",
+                    "Parsed Total Credit (selected)",
+                    "Expected Total Debit",
+                    "Expected Total Credit",
+                    "Diff Debit (parsed - expected)",
+                    "Diff Credit (parsed - expected)",
+                ],
+                "Value": [
+                    filtered_total_debit,
+                    filtered_total_credit,
+                    expected_total_debit,
+                    expected_total_credit,
+                    filtered_total_debit - expected_total_debit if expected_total_debit else 0.0,
+                    filtered_total_credit - expected_total_credit if expected_total_credit else 0.0,
+                ]
+            }).to_excel(writer, sheet_name="Amount_Audit_Summary", index=False)
+
+            if not bad_all.empty:
+                bad_all.to_excel(writer, sheet_name="Bad_Amount_Cells", index=False)
+            if isinstance(credit_digit_zero, pd.DataFrame) and not credit_digit_zero.empty:
+                credit_digit_zero.to_excel(writer, sheet_name="Credit_DigitZero", index=False)
+            if isinstance(debit_digit_zero, pd.DataFrame) and not debit_digit_zero.empty:
+                debit_digit_zero.to_excel(writer, sheet_name="Debit_DigitZero", index=False)
 
     excel_buffer.seek(0)
     st.download_button(
