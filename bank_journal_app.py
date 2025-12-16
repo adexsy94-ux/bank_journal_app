@@ -625,10 +625,6 @@ def append_opening_balance_journal(
     return combined
 
 
-# -----------------------------
-# ✅ CASHFLOW (IFRS) — FIXED VERSION
-# -----------------------------
-
 def build_cashbook_ifrs(
     journal_df: pd.DataFrame,
     bank_account_name: str,
@@ -649,65 +645,43 @@ def build_cashbook_ifrs(
     """
     df = ensure_journal_dates(journal_df)
 
-    # Robust account name match (strip to avoid hidden space mismatches)
-    bank_name = str(bank_account_name).strip()
-    cb = df[df["Account"].astype(str).str.strip() == bank_name].copy()
+    cb = df[df["Account"] == bank_account_name].copy()
     cb = cb.sort_values(["Date_dt", "Leg"])
 
     if cb.empty:
         return cb, pd.DataFrame()
 
-    # Movement (+ for inflow, - for outflow) with rounding to avoid float noise
-    cb["Cash_Movement"] = (cb["Dr Amount"] - cb["Cr Amount"]).round(2)
+    # Movement (+ for inflow, - for outflow)
+    cb["Cash_Movement"] = cb["Dr Amount"] - cb["Cr Amount"]
 
-    # Normalize Cash Flow Category:
-    # - handle blanks
-    # - handle case/space differences
-    # - handle common variants
+    # Use Cash Flow Category if present, else default to Operating
     if "Cash Flow Category" in cb.columns:
-        raw_cat = cb["Cash Flow Category"].fillna("").astype(str).str.strip()
+        cf_cat = cb["Cash Flow Category"].fillna("")
+        cf_cat = cf_cat.replace("", "Operating")
+        cb["Cash Flow Category"] = cf_cat
     else:
-        raw_cat = pd.Series([""] * len(cb), index=cb.index)
-
-    # Blank => Operating (keeps your original intent)
-    raw_cat = raw_cat.replace("", "Operating")
-
-    raw_lower = raw_cat.str.lower()
-
-    normalized = pd.Series("Operating", index=cb.index)  # default to Operating
-    normalized[raw_lower.str.contains(r"\bopening\b")] = "Opening Balance"
-    normalized[raw_lower.str.contains(r"\binvest")] = "Investing"
-    normalized[raw_lower.str.contains(r"\bfinanc|borrow|loan")] = "Financing"
-    normalized[raw_lower.str.contains(r"\boperat")] = "Operating"
-
-    cb["Cash Flow Category"] = normalized
+        cb["Cash Flow Category"] = "Operating"
 
     # Running cash balance based purely on journal movements
-    cb["Running_Cash_Balance"] = cb["Cash_Movement"].cumsum().round(2)
+    cb["Running_Cash_Balance"] = cb["Cash_Movement"].cumsum()
 
     # Opening balance from journal (rows tagged as Opening Balance)
     opening_journal_balance = cb.loc[
         cb["Cash Flow Category"] == "Opening Balance", "Cash_Movement"
     ].sum()
 
-    # Summaries by section (for reporting)
+    # Summaries by section (exclude Opening Balance category from net cash)
     operating_total = cb.loc[cb["Cash Flow Category"] == "Operating", "Cash_Movement"].sum()
     investing_total = cb.loc[cb["Cash Flow Category"] == "Investing", "Cash_Movement"].sum()
     financing_total = cb.loc[cb["Cash Flow Category"] == "Financing", "Cash_Movement"].sum()
 
-    # ✅ KEY RECONCILIATION FIX:
-    # Net change should be ALL movements except Opening Balance (not just the 3 buckets),
-    # so it always reconciles with the running ledger.
-    net_change = cb.loc[
-        cb["Cash Flow Category"] != "Opening Balance", "Cash_Movement"
-    ].sum()
-
-    closing_balance_calc = round(opening_journal_balance + net_change, 2)
+    net_change = operating_total + investing_total + financing_total
+    closing_balance_calc = opening_journal_balance + net_change
 
     # Last running balance from movements
-    closing_balance_running = float(cb["Running_Cash_Balance"].iloc[-1])
+    closing_balance_running = cb["Running_Cash_Balance"].iloc[-1]
 
-    diff = round(closing_balance_calc - closing_balance_running, 2)
+    diff = closing_balance_calc - closing_balance_running
 
     summary_rows = [
         {"Line": "Net cash from Operating activities", "Amount": operating_total},
